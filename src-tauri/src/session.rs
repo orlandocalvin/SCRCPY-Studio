@@ -355,7 +355,8 @@ fn build_args(config: &LaunchConfig, recording: Option<&Path>) -> Vec<String> {
             if config.max_fps > 0 {
                 args.push(format!("--camera-fps={}", config.max_fps));
             }
-            if config.camera_high_speed && camera_size.is_some() {
+            // scrcpy rejects high-speed capture without an explicit --camera-fps.
+            if config.camera_high_speed && camera_size.is_some() && config.max_fps > 0 {
                 args.push("--camera-high-speed".into());
             }
             if let Some(zoom) = config
@@ -458,7 +459,11 @@ fn build_args(config: &LaunchConfig, recording: Option<&Path>) -> Vec<String> {
     if let Some(orientation) = capture_orientation_arg(config.capture_orientation.as_deref()) {
         args.push(orientation);
     }
-    if let Some(crop) = safe_crop(config.crop.as_deref()) {
+    // scrcpy rejects --crop together with --flex-display.
+    let flex_display = config.mode == "desktop"
+        && config.desktop_environment.as_deref() != Some("samsung_dex")
+        && config.desktop_flex;
+    if let Some(crop) = safe_crop(config.crop.as_deref()).filter(|_| !flex_display) {
         args.push(format!("--crop={crop}"));
     }
     if let Some(path) = recording {
@@ -972,6 +977,31 @@ mod tests {
         assert!(args.contains(&"--camera-fps=120".to_string()));
         assert!(args.contains(&"--camera-high-speed".to_string()));
         assert!(!args.iter().any(|arg| arg.starts_with("--max-size=")));
+    }
+
+    #[test]
+    fn high_speed_camera_is_dropped_without_an_explicit_fps() {
+        let mut config = sample_config("camera");
+        config.camera_high_speed = true;
+        config.camera_size = Some("1280x720".into());
+        config.max_fps = 0;
+        let args = build_args(&config, None);
+        assert!(!args.contains(&"--camera-high-speed".to_string()));
+        assert!(!args.iter().any(|arg| arg.starts_with("--camera-fps=")));
+    }
+
+    #[test]
+    fn crop_is_skipped_with_flex_display_only() {
+        let mut config = sample_config("desktop");
+        config.crop = Some("1080:1920:0:0".into());
+        config.desktop_flex = true;
+        let args = build_args(&config, None);
+        assert!(args.contains(&"--flex-display".to_string()));
+        assert!(!args.iter().any(|arg| arg.starts_with("--crop=")));
+
+        config.desktop_flex = false;
+        let args = build_args(&config, None);
+        assert!(args.contains(&"--crop=1080:1920:0:0".to_string()));
     }
 
     #[test]
