@@ -31,6 +31,7 @@ export default function DesktopControls({ serial, config, onChange, onStatus, on
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const activeSerial = useRef(serial);
+  const inFlightProbe = useRef<{ serial: string; request: Promise<DesktopCapabilities> } | null>(null);
 
   const updateConfig = useCallback((patch: Partial<LaunchConfig>) => {
     if (config.serial !== serial || config.mode !== "desktop") return;
@@ -60,8 +61,15 @@ export default function DesktopControls({ serial, config, onChange, onStatus, on
     setError(null);
     onProbeStateChange({ serial, checking: true, capabilities: null, error: null });
     onStatus("Creating a temporary display and checking its real Android windowing state…");
+    // Share a probe already running for this phone (React runs mount effects
+    // twice in development) instead of starting a second one.
+    const pending = inFlightProbe.current;
+    const request = pending?.serial === serial
+      ? pending.request
+      : invoke<DesktopCapabilities>("probe_desktop_capabilities", { serial });
+    inFlightProbe.current = { serial, request };
     try {
-      const result = await invoke<DesktopCapabilities>("probe_desktop_capabilities", { serial });
+      const result = await request;
       if (activeSerial.current === serial) applyCapabilities(result);
       return result;
     } catch (probeError) {
@@ -75,6 +83,7 @@ export default function DesktopControls({ serial, config, onChange, onStatus, on
       }
       return null;
     } finally {
+      if (inFlightProbe.current?.request === request) inFlightProbe.current = null;
       if (activeSerial.current === serial) setBusy(false);
     }
   }, [applyCapabilities, onProbeStateChange, onStatus, serial, updateConfig]);

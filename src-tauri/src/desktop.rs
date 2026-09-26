@@ -889,6 +889,8 @@ fn display_id_from_args(args: &[String]) -> Option<u32> {
 
 const NEW_DISPLAY_TIMEOUT: Duration = Duration::from_secs(10);
 
+static PROBE_LOCK: Mutex<()> = Mutex::new(());
+
 fn orientation_lock_args(display_id: u32) -> [String; 5] {
     [
         "wm".into(),
@@ -1122,6 +1124,11 @@ pub(crate) fn restore_desktop_experience(
 
 #[tauri::command(async)]
 pub(crate) fn probe_desktop_capabilities(serial: String) -> Result<DesktopCapabilities, String> {
+    // Two probes at once start two scrcpy servers that fight over the device
+    // tunnel, so the second one always fails. Run probes one at a time.
+    let _probe_guard = PROBE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     ensure_ready_device(&serial)?;
     let profile = inspect_device(serial.clone())?;
     let wireless = profile.connection_kind == "wireless";
