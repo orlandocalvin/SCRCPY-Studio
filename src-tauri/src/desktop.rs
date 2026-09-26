@@ -889,6 +889,38 @@ fn display_id_from_args(args: &[String]) -> Option<u32> {
 
 const NEW_DISPLAY_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn orientation_lock_args(display_id: u32) -> [String; 5] {
+    [
+        "wm".into(),
+        "set-ignore-orientation-request".into(),
+        "-d".into(),
+        display_id.to_string(),
+        "true".into(),
+    ]
+}
+
+/// scrcpy creates virtual displays that rotate with their content, so a
+/// portrait-only phone app keeps flipping the whole desktop between portrait
+/// and landscape. Asking the display to ignore app orientation requests
+/// letterboxes those apps instead. Only applied to displays scrcpy created.
+fn ignore_app_orientation_requests(
+    serial: &str,
+    display_id: u32,
+    diagnostics: &mut DesktopDiagnostics,
+) {
+    let args = orientation_lock_args(display_id);
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    diagnostics.platform_evidence.push(match run_adb_shell(serial, &args) {
+        Ok(_) => format!(
+            "Display {display_id} ignores app orientation requests; portrait-only apps are letterboxed."
+        ),
+        Err(error) => format!(
+            "Display {display_id} may still rotate with its app: {}",
+            compact_error(&error)
+        ),
+    });
+}
+
 pub(crate) fn launch_desktop_and_watch(
     path: &Path,
     args: &[String],
@@ -964,6 +996,10 @@ pub(crate) fn launch_desktop_and_watch(
             started: false,
             diagnostics,
         });
+    }
+
+    if let Some(display_id) = created_display {
+        ignore_app_orientation_requests(serial, display_id, &mut diagnostics);
     }
 
     if let Some(display_id) = diagnostics.display_id {
@@ -1274,6 +1310,14 @@ mod tests {
     fn compact_error_skips_generic_demuxer_errors() {
         let output = "[stderr] ERROR: Could not find any ADB device\n[stderr] ERROR: Demuxer error\n[stderr] Killed";
         assert_eq!(compact_error(output), "Could not find any ADB device");
+    }
+
+    #[test]
+    fn orientation_lock_targets_only_the_created_display() {
+        assert_eq!(
+            orientation_lock_args(21),
+            ["wm", "set-ignore-orientation-request", "-d", "21", "true"].map(String::from)
+        );
     }
 
     #[test]
