@@ -221,8 +221,8 @@ export default function AdvancedSettings({
       ) : (
         <div className="toggle-list settings-toggles compact-toggles">
           <Toggle label="Forward audio" checked={config.audio} onChange={(audio) => update({ audio, audioSource: audio ? "output" : "off" })} />
-          <Toggle label="Keep phone awake" checked={config.stayAwake} onChange={(stayAwake) => update({ stayAwake, ...(stayAwake ? { turnScreenOff: false } : {}) })} />
-          <Toggle label="Turn screen off" checked={config.turnScreenOff} onChange={(turnScreenOff) => update({ turnScreenOff, ...(turnScreenOff ? { stayAwake: false } : {}) })} />
+          <Toggle label="Keep phone awake" hint={config.turnScreenOff ? "On while the screen is off" : undefined} checked={config.stayAwake || config.turnScreenOff} onChange={(stayAwake) => update({ stayAwake })} disabled={config.turnScreenOff} />
+          <Toggle label="Turn screen off" checked={config.turnScreenOff} onChange={(turnScreenOff) => update({ turnScreenOff, ...(turnScreenOff ? { stayAwake: true } : {}) })} />
           <Toggle label="Show touches" checked={config.showTouches} onChange={(showTouches) => update({ showTouches })} />
           <Toggle label="Start fullscreen" hint="Exit with F11" checked={config.fullscreen} onChange={(fullscreen) => update({ fullscreen })} />
         </div>

@@ -46,7 +46,7 @@ const configKeys: Array<keyof LaunchConfig> = [
 ];
 
 const liveKeys: Record<Extract<SessionMode, "creator" | "camera" | "desktop">, Array<keyof LaunchConfig>> = {
-  creator: ["stayAwake", "turnScreenOff", "showTouches", "fullscreen"],
+  creator: ["turnScreenOff", "showTouches", "fullscreen"],
   camera: ["cameraTorch", "fullscreen"],
   desktop: ["fullscreen"]
 };

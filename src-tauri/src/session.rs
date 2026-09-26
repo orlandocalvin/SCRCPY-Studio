@@ -1,7 +1,7 @@
 use crate::{
     creator::recordings_root,
     desktop::{compact_error, launch_desktop_and_watch},
-    devices::list_devices,
+    devices::{is_wireless_serial, list_devices},
     models::{DesktopDiagnostics, LaunchConfig, LaunchResult, SessionStatus},
     preferences::remember_successful_profile,
     runtime::{adb_path, scrcpy_command, scrcpy_path},
@@ -26,9 +26,7 @@ enum SettingBackup {
 struct ManagedSession {
     config: LaunchConfig,
     show_touches_backup: Option<SettingBackup>,
-    stay_awake_backup: Option<SettingBackup>,
     scrcpy_manages_show_touches: bool,
-    scrcpy_manages_stay_awake: bool,
     started_at: Instant,
 }
 
@@ -209,14 +207,6 @@ fn restore_setting(serial: &str, namespace: &str, key: &str, backup: SettingBack
 fn restore_live_settings(session: ManagedSession) {
     if let Some(backup) = session.show_touches_backup {
         restore_setting(&session.config.serial, "system", "show_touches", backup);
-    }
-    if let Some(backup) = session.stay_awake_backup {
-        restore_setting(
-            &session.config.serial,
-            "global",
-            "stay_on_while_plugged_in",
-            backup,
-        );
     }
 }
 
@@ -430,22 +420,27 @@ fn build_args(config: &LaunchConfig, recording: Option<&Path>) -> Vec<String> {
     }
     if !config.audio || config.audio_source.as_deref() == Some("off") {
         args.push("--no-audio".into());
-    } else if let Some(source) = config
-        .audio_source
-        .as_deref()
-        .filter(|source| matches!(*source, "output" | "mic"))
-    {
-        args.push(format!("--audio-source={source}"));
+    } else {
+        if let Some(source) = config
+            .audio_source
+            .as_deref()
+            .filter(|source| matches!(*source, "output" | "mic"))
+        {
+            args.push(format!("--audio-source={source}"));
+        }
+        // Wi-Fi jitter underruns scrcpy's default 50 ms audio buffer, which is
+        // heard as choppy audio. Trade a little latency for smooth playback.
+        if is_wireless_serial(&config.serial) {
+            args.push(format!("--audio-buffer={WIRELESS_AUDIO_BUFFER_MS}"));
+        }
     }
-    // Some OEMs (including Samsung One UI) keep the physical panel lit when
-    // stay-awake and turn-screen-off are requested together. Screen-off is the
-    // more specific intent, so it must win even for stale or imported configs.
-    if config.stay_awake && !config.turn_screen_off && config.mode != "camera" {
-        args.push(if config.mode == "desktop" {
-            "--keep-active".into()
-        } else {
-            "--stay-awake".into()
-        });
+    // --stay-awake only works while the phone is charging, so over Wi-Fi on
+    // battery it did nothing. --keep-active simulates user activity and works
+    // on battery. A screen turned off by scrcpy needs it too: only the panel is
+    // off, so Android's screen timeout would still put the phone to sleep, and
+    // lock it, whenever the PC stops sending input.
+    if (config.stay_awake || config.turn_screen_off) && config.mode != "camera" {
+        args.push("--keep-active".into());
     }
     if config.turn_screen_off && config.mode != "camera" {
         args.push("--turn-screen-off".into());
@@ -487,6 +482,8 @@ fn shell_preview(path: &Path, args: &[String]) -> String {
         .join(" ");
     format!("{} {}", path.display(), quoted)
 }
+
+const WIRELESS_AUDIO_BUFFER_MS: u32 = 150;
 
 fn launch_and_watch(path: &Path, args: &[String]) -> Result<bool, String> {
     let mut child = scrcpy_command(path)
@@ -665,11 +662,7 @@ pub(crate) fn launch_session(
                 *active = Some(ManagedSession {
                     config: variant.clone(),
                     show_touches_backup: None,
-                    stay_awake_backup: None,
                     scrcpy_manages_show_touches: variant.show_touches,
-                    scrcpy_manages_stay_awake: variant.stay_awake
-                        && !variant.turn_screen_off
-                        && variant.mode != "camera",
                     started_at: Instant::now(),
                 });
             }
@@ -827,22 +820,6 @@ pub(crate) fn apply_live_setting(
             )?;
             session.config.show_touches = config.show_touches;
         }
-        "stayAwake" if config.mode != "camera" && config.mode != "desktop" => {
-            if session.stay_awake_backup.is_none() && !session.scrcpy_manages_stay_awake {
-                session.stay_awake_backup = Some(read_setting(
-                    &config.serial,
-                    "global",
-                    "stay_on_while_plugged_in",
-                )?);
-            }
-            write_setting(
-                &config.serial,
-                "global",
-                "stay_on_while_plugged_in",
-                if config.stay_awake { "7" } else { "0" },
-            )?;
-            session.config.stay_awake = config.stay_awake;
-        }
         "cameraTorch" if config.mode == "camera" => {
             native_window::press_mod_key(&config.serial, 't', !config.camera_torch)?;
             session.config.camera_torch = config.camera_torch;
@@ -952,13 +929,32 @@ mod tests {
     }
 
     #[test]
-    fn screen_off_takes_precedence_over_stay_awake() {
+    fn screen_off_keeps_the_phone_active_on_battery() {
         let mut config = sample_config("mirror");
-        config.stay_awake = true;
+        config.stay_awake = false;
         config.turn_screen_off = true;
         let args = build_args(&config, None);
         assert!(args.contains(&"--turn-screen-off".to_string()));
+        assert!(args.contains(&"--keep-active".to_string()));
         assert!(!args.contains(&"--stay-awake".to_string()));
+
+        config.turn_screen_off = false;
+        let args = build_args(&config, None);
+        assert!(!args.contains(&"--keep-active".to_string()));
+    }
+
+    #[test]
+    fn wireless_audio_gets_a_larger_buffer() {
+        let mut config = sample_config("mirror");
+        assert!(!build_args(&config, None)
+            .iter()
+            .any(|arg| arg.starts_with("--audio-buffer=")));
+        config.serial = "192.168.0.101:44741".into();
+        assert!(build_args(&config, None).contains(&"--audio-buffer=150".to_string()));
+        config.audio = false;
+        assert!(!build_args(&config, None)
+            .iter()
+            .any(|arg| arg.starts_with("--audio-buffer=")));
     }
 
     #[test]
