@@ -4,7 +4,9 @@ mod creator;
 mod desktop;
 mod devices;
 mod doctor;
+mod event_log;
 mod models;
+mod physical_input;
 mod preferences;
 mod runtime;
 mod session;
@@ -20,7 +22,8 @@ use devices::{inspect_device, list_devices, recommend_settings};
 use doctor::run_doctor;
 use runtime::{install_official_runtime, runtime_status};
 use session::{
-    apply_live_setting, launch_session, session_status, stop_managed_session, SessionManager,
+    apply_live_setting, launch_session, session_status, stop_managed_session, wake_phone,
+    SessionManager,
 };
 use tauri::Manager;
 use wireless::{
@@ -62,6 +65,7 @@ pub fn run() {
             launch_session,
             session_status,
             apply_live_setting,
+            wake_phone,
             run_doctor
         ])
         .run(tauri::generate_context!())

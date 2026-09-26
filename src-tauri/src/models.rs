@@ -138,13 +138,19 @@ pub(crate) struct LaunchResult {
     pub(crate) desktop_diagnostics: Option<DesktopDiagnostics>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionStatus {
     pub(crate) active: bool,
     pub(crate) serial: Option<String>,
     pub(crate) mode: Option<String>,
     pub(crate) applied_config: Option<LaunchConfig>,
+    /// The mirrored phone was asleep at the last power check.
+    pub(crate) phone_asleep: bool,
+    /// The phone showed its lock screen at the last check.
+    pub(crate) phone_locked: bool,
+    /// A one-time message about something that happened on the phone.
+    pub(crate) notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

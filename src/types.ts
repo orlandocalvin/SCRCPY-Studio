@@ -105,6 +105,9 @@ export interface SessionStatus {
   serial?: string | null;
   mode?: SessionMode | null;
   appliedConfig?: LaunchConfig | null;
+  phoneAsleep?: boolean;
+  phoneLocked?: boolean;
+  notice?: string | null;
 }
 
 export interface DoctorFinding {

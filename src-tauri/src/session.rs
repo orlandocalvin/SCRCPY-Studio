@@ -2,7 +2,9 @@ use crate::{
     creator::recordings_root,
     desktop::{app_data_dir, compact_error, launch_desktop_and_watch},
     devices::{is_wireless_serial, list_devices},
+    event_log::EventLog,
     models::{DesktopDiagnostics, LaunchConfig, LaunchResult, SessionStatus},
+    physical_input::PhysicalInputWatch,
     preferences::remember_successful_profile,
     runtime::{adb_path, scrcpy_command, scrcpy_path},
 };
@@ -10,7 +12,10 @@ use chrono::Local;
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -27,6 +32,225 @@ struct ManagedSession {
     show_touches_backup: Option<SettingBackup>,
     scrcpy_manages_show_touches: bool,
     started_at: Instant,
+    power: PowerWatch,
+    phone: Arc<PhoneControl>,
+    /// Notices hands on the phone while mirroring; see `physical_input`.
+    input_watch: Option<PhysicalInputWatch>,
+    /// F11 is handled asynchronously by scrcpy; do not read the window state
+    /// back before it has had time to switch.
+    fullscreen_settles_at: Instant,
+    /// The phone screen may briefly be on while scrcpy starts or while a
+    /// screen-off change is applied; do not read that as the user's doing.
+    panel_settles_at: Instant,
+}
+
+/// How often the phone state is read while mirroring.
+const POWER_CHECK_INTERVAL: Duration = Duration::from_secs(3);
+/// scrcpy turns the phone on itself when a session starts.
+const PANEL_SETTLE: Duration = Duration::from_secs(5);
+const SCREEN_TURNED_ON_NOTICE: &str = "Phone screen was turned on from the phone.";
+/// One adb round trip for everything the watchdog needs. `; true` keeps the
+/// exit status successful when a grep finds nothing.
+const PHONE_STATE_QUERY: &str =
+    "dumpsys power | grep -E 'mWakefulness=|mLastSleepTime=|mLastSleepReason='; \
+    dumpsys SurfaceFlinger 2>/dev/null | grep -m1 powerMode; \
+    dumpsys window 2>/dev/null | grep -m1 isKeyguardShowing; true";
+
+/// What the phone reports about itself. `screen_on` is the panel power mode
+/// from SurfaceFlinger: unlike `dumpsys power`, it also sees a panel that
+/// scrcpy switched off while the phone stays awake.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct PhoneState {
+    awake: bool,
+    last_sleep_time: Option<u64>,
+    last_sleep_reason: Option<String>,
+    screen_on: Option<bool>,
+    locked: bool,
+}
+
+fn parse_phone_state(text: &str) -> Option<PhoneState> {
+    let value = |key: &str| {
+        text.lines()
+            .find_map(|line| line.trim().strip_prefix(key))
+            .map(str::trim)
+    };
+    let wakefulness = value("mWakefulness=")?;
+    Some(PhoneState {
+        awake: matches!(wakefulness, "Awake" | "Dreaming"),
+        last_sleep_time: value("mLastSleepTime=")
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse().ok()),
+        last_sleep_reason: value("mLastSleepReason=").map(str::to_string),
+        screen_on: value("powerMode=").map(|mode| mode == "On"),
+        locked: value("isKeyguardShowing=") == Some("true"),
+    })
+}
+
+#[derive(Debug, Default)]
+struct PowerWatch {
+    checked_at: Option<Instant>,
+    previous: Option<PhoneState>,
+    asleep: bool,
+    screen_on: Option<bool>,
+    locked: bool,
+    notice: Option<String>,
+}
+
+impl PowerWatch {
+    /// Updates the known phone state. Returns true when the phone screen is
+    /// kept off but its power button was pressed, or the screen came back on
+    /// some other way once `settled`. Hands on the phone are usually noticed
+    /// sooner by `PhysicalInputWatch`; this is the fallback.
+    fn observe(&mut self, state: Option<PhoneState>, screen_off: bool, settled: bool) -> bool {
+        let mut slept = false;
+        if let Some(state) = state {
+            self.asleep = !state.awake;
+            self.screen_on = state.screen_on;
+            self.locked = state.locked;
+            slept = self
+                .previous
+                .replace(state.clone())
+                .is_some_and(|previous| previous.last_sleep_time != state.last_sleep_time);
+        }
+        let reason = self
+            .previous
+            .as_ref()
+            .and_then(|state| state.last_sleep_reason.clone())
+            .unwrap_or_else(|| "unknown".into());
+        let screen_came_on = settled && !self.asleep && self.screen_on == Some(true);
+
+        if screen_off && ((slept && reason == "power_button") || screen_came_on) {
+            self.notice = Some(SCREEN_TURNED_ON_NOTICE.into());
+            return true;
+        }
+        if slept && self.asleep {
+            self.notice = Some(format!(
+                "The phone went to sleep ({reason}). Use Wake Phone to continue mirroring."
+            ));
+        }
+        false
+    }
+}
+
+/// Screen-off state shared between the session and the threads that watch the
+/// phone. `keep_screen_off` is the source of truth; the session config follows it.
+#[derive(Debug)]
+struct PhoneControl {
+    serial: String,
+    keep_screen_off: AtomicBool,
+    power_presses: AtomicU64,
+    restoring: AtomicBool,
+    events: EventLog,
+}
+
+impl PhoneControl {
+    /// Called for each physical input on the phone (see `PhysicalInputWatch`).
+    fn on_physical_input(self: &Arc<Self>, line: &str) {
+        let power_key = line.contains("KEY_POWER");
+        if power_key {
+            self.power_presses.fetch_add(1, Ordering::SeqCst);
+        }
+        if line.contains("EV_KEY") {
+            self.events.write(format!("phone key: {line}"));
+        }
+        if self.keep_screen_off.swap(false, Ordering::SeqCst) {
+            self.events.write(format!(
+                "hands on the phone ({line}); turning its screen on"
+            ));
+            self.turn_screen_on(power_key);
+        }
+    }
+
+    /// Turns the phone screen back on in the background.
+    ///
+    /// MOD+Shift+o makes scrcpy power the panel on and stop keeping it off,
+    /// but on some phones (seen on HyperOS) the backlight stays dark, so the
+    /// backlight is relit too. A power key press also puts an awake phone to
+    /// sleep; waking it then lights the screen through Android itself, unless
+    /// the user pressed the key again meanwhile.
+    fn turn_screen_on(self: &Arc<Self>, after_power_key: bool) {
+        if self.restoring.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let phone = self.clone();
+        thread::spawn(move || {
+            let presses = phone.power_presses.load(Ordering::SeqCst);
+            phone.send_screen_on_shortcut();
+            let mut left_to_user = false;
+            if after_power_key {
+                thread::sleep(Duration::from_millis(600));
+                if phone.power_presses.load(Ordering::SeqCst) == presses {
+                    let woke = adb_shell(&phone.serial, &["input", "keyevent", "KEYCODE_WAKEUP"]);
+                    phone.events.write(format!("sent KEYCODE_WAKEUP: {woke:?}"));
+                } else {
+                    left_to_user = true;
+                    phone
+                        .events
+                        .write("power key pressed again; leaving the phone as the user set it");
+                }
+            }
+            if !left_to_user {
+                relight_backlight(&phone.serial, &phone.events);
+            }
+            let state = adb_shell(&phone.serial, &[PHONE_STATE_QUERY])
+                .ok()
+                .and_then(|text| parse_phone_state(&text));
+            phone
+                .events
+                .write(format!("phone after turning its screen on: {state:?}"));
+            phone.restoring.store(false, Ordering::SeqCst);
+        });
+    }
+
+    fn send_screen_on_shortcut(&self) {
+        let sent = native_window::press_mod_key(&self.serial, 'o', true);
+        self.events.write(format!("sent MOD+Shift+o: {sent:?}"));
+    }
+}
+
+/// scrcpy can power the panel back on without its backlight on some phones
+/// (seen on HyperOS). Nudging the brightness setting makes Android write the
+/// backlight again; the original values are put back straight away.
+fn relight_backlight(serial: &str, events: &EventLog) {
+    let setting = |key: &str| {
+        adb_shell(serial, &["settings", "get", "system", key])
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+    };
+    let (Some(mode), Some(level)) = (
+        setting("screen_brightness_mode"),
+        setting("screen_brightness"),
+    ) else {
+        events.write("could not read the brightness settings to relight the screen");
+        return;
+    };
+    let nudged = if level >= 255 { level - 1 } else { level + 1 };
+    let script = format!(
+        "settings put system screen_brightness_mode 0; \
+         settings put system screen_brightness {nudged}; sleep 1; \
+         settings put system screen_brightness {level}; \
+         settings put system screen_brightness_mode {mode}"
+    );
+    let result = adb_shell(serial, &[&script]);
+    events.write(format!(
+        "relit the backlight (brightness {level}, mode {mode}): {result:?}"
+    ));
+}
+
+fn watches_phone_power(config: &LaunchConfig) -> bool {
+    matches!(config.mode.as_str(), "creator" | "mirror")
+}
+
+fn status_of(session: &ManagedSession) -> SessionStatus {
+    SessionStatus {
+        active: true,
+        serial: Some(session.config.serial.clone()),
+        mode: Some(session.config.mode.clone()),
+        applied_config: Some(session.config.clone()),
+        phone_asleep: session.power.asleep,
+        phone_locked: session.power.locked,
+        notice: None,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -52,9 +276,29 @@ mod native_window {
     const VK_SHIFT: usize = 0x10;
     const VK_F11: usize = 0x7a;
 
+    const MONITOR_DEFAULTTONEAREST: u32 = 2;
+
     struct WindowSearch {
         title: String,
         found: isize,
+    }
+
+    #[repr(C)]
+    #[derive(Default, PartialEq)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct MonitorInfo {
+        size: u32,
+        monitor: Rect,
+        work: Rect,
+        flags: u32,
     }
 
     #[link(name = "user32")]
@@ -66,6 +310,10 @@ mod native_window {
         fn GetWindowTextLengthW(window: isize) -> i32;
         fn GetWindowTextW(window: isize, text: *mut u16, max_count: i32) -> i32;
         fn IsWindow(window: isize) -> i32;
+        fn IsIconic(window: isize) -> i32;
+        fn GetWindowRect(window: isize, rect: *mut Rect) -> i32;
+        fn MonitorFromWindow(window: isize, flags: u32) -> isize;
+        fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
         fn PostMessageW(window: isize, message: u32, wparam: usize, lparam: isize) -> i32;
         fn SetForegroundWindow(window: isize) -> i32;
     }
@@ -118,6 +366,30 @@ mod native_window {
         }
     }
 
+    /// scrcpy uses borderless desktop fullscreen, so a fullscreen window covers
+    /// its whole monitor. None when the window is missing or minimized.
+    pub(super) fn is_fullscreen(serial: &str) -> Option<bool> {
+        let window = find(serial)?;
+        unsafe {
+            if IsIconic(window) != 0 {
+                return None;
+            }
+            let mut rect = Rect::default();
+            if GetWindowRect(window, &mut rect) == 0 {
+                return None;
+            }
+            let monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+            let mut info = MonitorInfo {
+                size: std::mem::size_of::<MonitorInfo>() as u32,
+                ..MonitorInfo::default()
+            };
+            if monitor == 0 || GetMonitorInfoW(monitor, &mut info) == 0 {
+                return None;
+            }
+            Some(rect == info.monitor)
+        }
+    }
+
     pub(super) fn press_f11(serial: &str) -> Result<(), String> {
         let window =
             find(serial).ok_or_else(|| "The active scrcpy window was not found.".to_string())?;
@@ -129,12 +401,14 @@ mod native_window {
         Ok(())
     }
 
+    /// Posts MOD+key to the scrcpy window. SDL handles posted key messages
+    /// without keyboard focus, so this works while the user is in another app
+    /// (Windows would often refuse to bring the window to the front anyway).
     pub(super) fn press_mod_key(serial: &str, key: char, shift: bool) -> Result<(), String> {
         let window =
             find(serial).ok_or_else(|| "The active scrcpy window was not found.".to_string())?;
         let key = key.to_ascii_uppercase() as usize;
         unsafe {
-            SetForegroundWindow(window);
             PostMessageW(window, WM_SYSKEYDOWN, VK_MENU, 0);
             if shift {
                 PostMessageW(window, WM_KEYDOWN, VK_SHIFT, 0);
@@ -156,6 +430,9 @@ mod native_window {
         true
     }
     pub(super) fn close(_serial: &str) {}
+    pub(super) fn is_fullscreen(_serial: &str) -> Option<bool> {
+        None
+    }
     pub(super) fn press_f11(_serial: &str) -> Result<(), String> {
         Err("Live window controls are currently available on Windows only.".into())
     }
@@ -206,6 +483,18 @@ fn restore_setting(serial: &str, namespace: &str, key: &str, backup: SettingBack
 fn restore_live_settings(session: ManagedSession) {
     if let Some(backup) = session.show_touches_backup {
         restore_setting(&session.config.serial, "system", "show_touches", backup);
+    }
+    // scrcpy powers the panel back on when it exits, which can leave the
+    // backlight dark (see `relight_backlight`).
+    if session.phone.keep_screen_off.load(Ordering::SeqCst) {
+        let phone = session.phone.clone();
+        phone
+            .events
+            .write("session ended with the phone screen off");
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1500));
+            relight_backlight(&phone.serial, &phone.events);
+        });
     }
 }
 
@@ -483,7 +772,7 @@ fn shell_preview(path: &Path, args: &[String]) -> String {
 }
 
 const WIRELESS_AUDIO_BUFFER_MS: u32 = 150;
-
+const FULLSCREEN_SETTLE: Duration = Duration::from_millis(1500);
 const KEPT_SESSION_LOGS: usize = 40;
 
 fn session_logs_dir() -> Result<PathBuf, String> {
@@ -700,12 +989,35 @@ pub(crate) fn launch_session(
         if started {
             let fallback_used = index > 0;
             let remembered = remember_successful_profile(variant).is_ok();
+            let events = last_log
+                .as_ref()
+                .map(|log| EventLog::create(&log.with_extension("events.log")))
+                .unwrap_or_default();
+            events.write(format!(
+                "session started: mode {}, turn screen off {}, keep awake {}",
+                variant.mode, variant.turn_screen_off, variant.stay_awake
+            ));
+            let phone = Arc::new(PhoneControl {
+                serial: variant.serial.clone(),
+                keep_screen_off: AtomicBool::new(
+                    variant.turn_screen_off && watches_phone_power(variant),
+                ),
+                power_presses: AtomicU64::new(0),
+                restoring: AtomicBool::new(false),
+                events,
+            });
             if let Ok(mut active) = manager.active.lock() {
+                let now = Instant::now();
                 *active = Some(ManagedSession {
                     config: variant.clone(),
                     show_touches_backup: None,
                     scrcpy_manages_show_touches: variant.show_touches,
-                    started_at: Instant::now(),
+                    started_at: now,
+                    power: PowerWatch::default(),
+                    phone,
+                    input_watch: None,
+                    fullscreen_settles_at: now + FULLSCREEN_SETTLE,
+                    panel_settles_at: now + PANEL_SETTLE,
                 });
             }
             return Ok(LaunchResult {
@@ -789,13 +1101,10 @@ pub(crate) fn launch_session(
 #[tauri::command(async)]
 pub(crate) fn session_status(manager: tauri::State<'_, SessionManager>) -> SessionStatus {
     let ended = if let Ok(mut active) = manager.active.lock() {
-        if active
-            .as_ref()
-            .is_some_and(|session| {
-                session.started_at.elapsed() > Duration::from_secs(3)
-                    && !native_window::exists(&session.config.serial)
-            })
-        {
+        if active.as_ref().is_some_and(|session| {
+            session.started_at.elapsed() > Duration::from_secs(3)
+                && !native_window::exists(&session.config.serial)
+        }) {
             active.take()
         } else {
             None
@@ -807,22 +1116,114 @@ pub(crate) fn session_status(manager: tauri::State<'_, SessionManager>) -> Sessi
         restore_live_settings(session);
     }
 
-    if let Ok(active) = manager.active.lock() {
-        if let Some(session) = active.as_ref() {
-            return SessionStatus {
-                active: true,
-                serial: Some(session.config.serial.clone()),
-                mode: Some(session.config.mode.clone()),
-                applied_config: Some(session.config.clone()),
-            };
+    // Read the phone state at most every few seconds, outside the lock: adb
+    // over Wi-Fi can take a while. Hands on the phone are handled as they
+    // happen by the input watch.
+    let power_check = manager.active.lock().ok().and_then(|mut active| {
+        let session = active.as_mut()?;
+        let due = session
+            .power
+            .checked_at
+            .is_none_or(|at| at.elapsed() >= POWER_CHECK_INTERVAL);
+        if !due || !watches_phone_power(&session.config) {
+            return None;
         }
+        session.power.checked_at = Some(Instant::now());
+        let restart_input_watch = !session
+            .input_watch
+            .as_mut()
+            .is_some_and(PhysicalInputWatch::is_running);
+        Some((session.phone.clone(), restart_input_watch))
+    });
+    let mut new_input_watch = None;
+    let phone_state = power_check.and_then(|(phone, restart_input_watch)| {
+        if restart_input_watch {
+            let watched = phone.clone();
+            new_input_watch = PhysicalInputWatch::start(&phone.serial, move |line| {
+                watched.on_physical_input(line)
+            })
+            .inspect_err(|error| phone.events.write(format!("input watch failed: {error}")))
+            .ok();
+        }
+        adb_shell(&phone.serial, &[PHONE_STATE_QUERY])
+            .ok()
+            .and_then(|text| parse_phone_state(&text))
+    });
+
+    match manager.active.lock() {
+        Ok(mut active) => match active.as_mut() {
+            Some(session) => {
+                if new_input_watch.is_some() {
+                    session.input_watch = new_input_watch;
+                }
+                let phone = session.phone.clone();
+                if phone_state.is_some() && phone_state != session.power.previous {
+                    phone.events.write(format!("phone state: {phone_state:?}"));
+                }
+                let settled = Instant::now() >= session.panel_settles_at;
+                let keep_off = phone.keep_screen_off.load(Ordering::SeqCst);
+                if session.power.observe(phone_state, keep_off, settled)
+                    && phone.keep_screen_off.swap(false, Ordering::SeqCst)
+                {
+                    phone
+                        .events
+                        .write("phone screen came on or its power key was pressed");
+                    phone.turn_screen_on(session.power.asleep);
+                }
+                // The input watch and the checks above may have handed the
+                // phone back to the user; make the settings follow.
+                if watches_phone_power(&session.config)
+                    && session.config.turn_screen_off
+                    && !phone.keep_screen_off.load(Ordering::SeqCst)
+                {
+                    session.config.turn_screen_off = false;
+                    session.panel_settles_at = Instant::now() + PANEL_SETTLE;
+                    session.power.notice = Some(SCREEN_TURNED_ON_NOTICE.into());
+                }
+                if Instant::now() >= session.fullscreen_settles_at {
+                    if let Some(fullscreen) = native_window::is_fullscreen(&session.config.serial) {
+                        session.config.fullscreen = fullscreen;
+                    }
+                }
+                let mut status = status_of(session);
+                status.notice = session.power.notice.take();
+                status
+            }
+            None => SessionStatus::default(),
+        },
+        Err(_) => SessionStatus::default(),
     }
-    SessionStatus {
-        active: false,
-        serial: None,
-        mode: None,
-        applied_config: None,
+}
+
+/// Wakes the phone without the toggle behaviour of POWER. If SCRCPY Studio is
+/// keeping the phone screen off, turn the panel off again once it is awake.
+#[tauri::command(async)]
+pub(crate) fn wake_phone(
+    manager: tauri::State<'_, SessionManager>,
+    serial: String,
+) -> Result<String, String> {
+    let phone = manager.active.lock().ok().and_then(|mut active| {
+        let session = active
+            .as_mut()
+            .filter(|session| session.config.serial == serial)?;
+        session.panel_settles_at = Instant::now() + PANEL_SETTLE;
+        session.power.asleep = false;
+        Some(session.phone.clone())
+    });
+    adb_shell(&serial, &["input", "keyevent", "KEYCODE_WAKEUP"])?;
+    let Some(phone) = phone else {
+        return Ok("Phone woken up.".into());
+    };
+    phone.events.write("Wake Phone: sent KEYCODE_WAKEUP");
+    if phone.keep_screen_off.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(700));
+        native_window::press_mod_key(&serial, 'o', false)?;
+        phone
+            .events
+            .write("Wake Phone: sent MOD+o to keep the screen off");
+        return Ok("Phone woken up; its screen stays off while mirroring.".into());
     }
+    Ok("Phone woken up.".into())
 }
 
 #[tauri::command(async)]
@@ -849,10 +1250,23 @@ pub(crate) fn apply_live_setting(
         "fullscreen" => {
             native_window::press_f11(&config.serial)?;
             session.config.fullscreen = config.fullscreen;
+            session.fullscreen_settles_at = Instant::now() + FULLSCREEN_SETTLE;
         }
         "turnScreenOff" if config.mode != "camera" => {
             native_window::press_mod_key(&config.serial, 'o', !config.turn_screen_off)?;
             session.config.turn_screen_off = config.turn_screen_off;
+            session.panel_settles_at = Instant::now() + PANEL_SETTLE;
+            let phone = session.phone.clone();
+            phone
+                .keep_screen_off
+                .store(config.turn_screen_off, Ordering::SeqCst);
+            phone.events.write(format!(
+                "Turn screen off switched {} in the app",
+                if config.turn_screen_off { "on" } else { "off" }
+            ));
+            if !config.turn_screen_off {
+                thread::spawn(move || relight_backlight(&phone.serial, &phone.events));
+            }
         }
         "showTouches" if config.mode != "camera" => {
             if session.show_touches_backup.is_none() && !session.scrcpy_manages_show_touches {
@@ -874,12 +1288,7 @@ pub(crate) fn apply_live_setting(
         _ => return Err("This setting requires restarting the current scrcpy session.".into()),
     }
 
-    Ok(SessionStatus {
-        active: true,
-        serial: Some(session.config.serial.clone()),
-        mode: Some(session.config.mode.clone()),
-        applied_config: Some(session.config.clone()),
-    })
+    Ok(status_of(session))
 }
 
 fn desktop_launch_name(config: &LaunchConfig) -> &'static str {
@@ -1002,6 +1411,84 @@ mod tests {
         assert!(!build_args(&config, None)
             .iter()
             .any(|arg| arg.starts_with("--audio-buffer=")));
+    }
+
+    const PHONE_DUMP: &str = "  mWakefulness=Awake\n  mLastSleepTime=9414070 (387785 ms ago)\n  mLastSleepReason=timeout\n   powerMode=Off\n    isKeyguardShowing=false\n";
+
+    fn phone(awake: bool, sleep: u64, reason: &str, screen_on: bool) -> PhoneState {
+        PhoneState {
+            awake,
+            last_sleep_time: Some(sleep),
+            last_sleep_reason: Some(reason.into()),
+            screen_on: Some(screen_on),
+            locked: false,
+        }
+    }
+
+    #[test]
+    fn parses_the_phone_state_query() {
+        assert_eq!(
+            parse_phone_state(PHONE_DUMP),
+            Some(phone(true, 9414070, "timeout", false))
+        );
+        let locked = PHONE_DUMP.replace("isKeyguardShowing=false", "isKeyguardShowing=true");
+        assert!(parse_phone_state(&locked).is_some_and(|state| state.locked));
+        assert_eq!(parse_phone_state("nothing useful"), None);
+    }
+
+    /// A watch that has already seen an awake phone with its screen kept off.
+    fn watching() -> PowerWatch {
+        let mut watch = PowerWatch::default();
+        watch.observe(Some(phone(true, 10, "timeout", false)), true, true);
+        watch
+    }
+
+    fn phone_control(keep_screen_off: bool) -> Arc<PhoneControl> {
+        Arc::new(PhoneControl {
+            serial: "ABC".into(),
+            keep_screen_off: AtomicBool::new(keep_screen_off),
+            power_presses: AtomicU64::new(0),
+            // Pretend a restore is running so the test does not call adb.
+            restoring: AtomicBool::new(true),
+            events: EventLog::default(),
+        })
+    }
+
+    #[test]
+    fn hands_on_the_phone_end_screen_off() {
+        let phone = phone_control(true);
+        phone.on_physical_input("/dev/input/event4: EV_KEY KEY_RIGHT DOWN");
+        assert!(!phone.keep_screen_off.load(Ordering::SeqCst));
+        assert_eq!(phone.power_presses.load(Ordering::SeqCst), 0);
+
+        let phone = phone_control(false);
+        phone.on_physical_input("/dev/input/event1: EV_KEY KEY_POWER DOWN");
+        assert_eq!(phone.power_presses.load(Ordering::SeqCst), 1);
+        assert!(!phone.keep_screen_off.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn power_button_sleep_ends_screen_off() {
+        let mut watch = watching();
+        let pressed = phone(false, 30, "power_button", false);
+        assert!(watch.observe(Some(pressed), true, true));
+    }
+
+    #[test]
+    fn a_lit_screen_ends_screen_off_once_settled() {
+        let lit = phone(true, 10, "timeout", true);
+        assert!(!watching().observe(Some(lit.clone()), true, false));
+        assert!(watching().observe(Some(lit), true, true));
+    }
+
+    #[test]
+    fn timeout_sleep_keeps_screen_off_and_reports_it() {
+        let mut watch = watching();
+        let slept = phone(false, 30, "timeout", false);
+        assert!(!watch.observe(Some(slept), true, true));
+        assert!(watch.asleep);
+        let notice = watch.notice.as_deref().unwrap_or_default();
+        assert!(notice.contains("timeout"));
     }
 
     #[test]

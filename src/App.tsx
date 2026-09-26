@@ -13,11 +13,12 @@ import {
   Play,
   Radio,
   RefreshCw,
+  Sun,
   Usb,
   Wifi,
   X
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AdvancedSettings from "./AdvancedSettings";
 import CameraControls from "./CameraControls";
 import DesktopControls from "./DesktopControls";
@@ -50,6 +51,8 @@ const liveKeys: Record<Extract<SessionMode, "creator" | "camera" | "desktop">, A
   camera: ["cameraTorch", "fullscreen"],
   desktop: ["fullscreen"]
 };
+
+const externallySyncedKeys = ["turnScreenOff", "fullscreen"] as const;
 
 function liveConfigKeys(mode: SessionMode): Array<keyof LaunchConfig> {
   if (mode === "mirror") return liveKeys.creator;
@@ -111,6 +114,8 @@ function App() {
   const [launching, setLaunching] = useState(false);
   const [lastLaunchResult, setLastLaunchResult] = useState<LaunchResult | null>(null);
   const [activeSession, setActiveSession] = useState<SessionStatus>({ active: false });
+  const lastAppliedLive = useRef<LaunchConfig | null>(null);
+  const [waking, setWaking] = useState(false);
   const [cameraCapabilities, setCameraCapabilities] = useState<CameraCapabilities | null>(null);
   const [desktopProbe, setDesktopProbe] = useState<DesktopProbeState>({
     serial: "",
@@ -177,17 +182,37 @@ function App() {
     void refresh();
   }, [refresh]);
 
+  // The phone and the scrcpy window can change these outside the app (power
+  // button, F11 in the mirror window). Follow such changes in the controls.
+  const syncFromSession = useCallback((result: SessionStatus) => {
+    const applied = result.active ? result.appliedConfig ?? null : null;
+    const previous = lastAppliedLive.current;
+    lastAppliedLive.current = applied;
+    if (!applied || !previous || previous.serial !== applied.serial || previous.mode !== applied.mode) return;
+    const changed = externallySyncedKeys.filter((key) => previous[key] !== applied[key]);
+    if (!changed.length) return;
+    setConfig((current) => {
+      if (!current || current.serial !== applied.serial || current.mode !== applied.mode) return current;
+      const next = { ...current };
+      for (const key of changed) Object.assign(next, { [key]: applied[key] });
+      return next;
+    });
+  }, []);
+
   const readSessionStatus = useCallback(async () => {
     try {
       const result = await invoke<SessionStatus>("session_status");
       setActiveSession(result);
+      if (result.notice) setStatusText(result.notice);
+      syncFromSession(result);
       return result;
     } catch {
       const inactive: SessionStatus = { active: false };
       setActiveSession(inactive);
+      lastAppliedLive.current = null;
       return inactive;
     }
-  }, []);
+  }, [syncFromSession]);
 
   useEffect(() => {
     void readSessionStatus();
@@ -413,6 +438,19 @@ function App() {
       setStatusText(`Could not open media folder: ${String(error)}`);
     } finally {
       setCreatorBusy(false);
+    }
+  };
+
+  const wakePhone = async () => {
+    if (!selectedSerial) return;
+    setWaking(true);
+    try {
+      setStatusText(await invoke<string>("wake_phone", { serial: selectedSerial }));
+      await readSessionStatus();
+    } catch (error) {
+      setStatusText(`Could not wake the phone: ${String(error)}`);
+    } finally {
+      setWaking(false);
     }
   };
 
@@ -730,6 +768,20 @@ function App() {
             )}
 
             <div className="workspace-body">
+              {mode === "creator" && currentSessionMatches && activeSession.phoneAsleep && (
+                <div className="session-power" role="status">
+                  <span>Phone is asleep</span>
+                  <button className="secondary" onClick={() => void wakePhone()} disabled={waking}>
+                    {waking ? <RefreshCw size={14} className="spin" /> : <Sun size={14} />} Wake
+                  </button>
+                </div>
+              )}
+              {mode === "creator" && currentSessionMatches && !activeSession.phoneAsleep && activeSession.phoneLocked && (
+                <div className="session-power" role="status">
+                  <span>Phone locked: swipe up in the mirror, then type your PIN and press Enter.</span>
+                </div>
+              )}
+
               {mode === "camera" && activeConfig?.mode === "camera" && selectedSerial && (
                 <CameraControls serial={selectedSerial} config={activeConfig} onChange={changeConfig} onStatus={setStatusText} onCapabilitiesChange={setCameraCapabilities} />
               )}
