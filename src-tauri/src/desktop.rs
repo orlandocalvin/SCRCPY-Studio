@@ -181,7 +181,7 @@ fn stable_device_key(serial: &str) -> String {
     serial.to_string()
 }
 
-fn app_data_dir() -> Result<PathBuf, String> {
+pub(crate) fn app_data_dir() -> Result<PathBuf, String> {
     let base = dirs::config_local_dir()
         .or_else(dirs::data_local_dir)
         .or_else(dirs::home_dir)

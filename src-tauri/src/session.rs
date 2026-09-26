@@ -1,6 +1,6 @@
 use crate::{
     creator::recordings_root,
-    desktop::{compact_error, launch_desktop_and_watch},
+    desktop::{app_data_dir, compact_error, launch_desktop_and_watch},
     devices::{is_wireless_serial, list_devices},
     models::{DesktopDiagnostics, LaunchConfig, LaunchResult, SessionStatus},
     preferences::remember_successful_profile,
@@ -10,7 +10,6 @@ use chrono::Local;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Stdio,
     sync::Mutex,
     thread,
     time::{Duration, Instant},
@@ -485,11 +484,50 @@ fn shell_preview(path: &Path, args: &[String]) -> String {
 
 const WIRELESS_AUDIO_BUFFER_MS: u32 = 150;
 
-fn launch_and_watch(path: &Path, args: &[String]) -> Result<bool, String> {
+const KEPT_SESSION_LOGS: usize = 40;
+
+fn session_logs_dir() -> Result<PathBuf, String> {
+    let folder = app_data_dir()?.join("Session Logs");
+    fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+    Ok(folder)
+}
+
+/// Creates a log file for one scrcpy launch and removes the oldest logs so the
+/// folder does not grow without bound.
+fn new_session_log(config: &LaunchConfig) -> Result<PathBuf, String> {
+    let folder = session_logs_dir()?;
+    let mut logs = fs::read_dir(&folder)
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
+        .collect::<Vec<_>>();
+    logs.sort();
+    let excess = (logs.len() + 1).saturating_sub(KEPT_SESSION_LOGS);
+    for old in logs.iter().take(excess) {
+        let _ = fs::remove_file(old);
+    }
+    let serial = config
+        .serial
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>();
+    Ok(folder.join(format!(
+        "{}-{}-{serial}.log",
+        Local::now().format("%Y%m%d-%H%M%S%3f"),
+        config.mode
+    )))
+}
+
+/// Starts scrcpy with its output written to `log`, so failures and runtime
+/// warnings (audio underruns, disconnects) can be inspected afterwards.
+fn launch_and_watch(path: &Path, args: &[String], log: &Path) -> Result<bool, String> {
+    let file = fs::File::create(log).map_err(|e| e.to_string())?;
+    let stderr = file.try_clone().map_err(|e| e.to_string())?;
     let mut child = scrcpy_command(path)
         .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(file)
+        .stderr(stderr)
         .spawn()
         .map_err(|e| e.to_string())?;
 
@@ -645,6 +683,7 @@ pub(crate) fn launch_session(
     let variants = fallback_configs(&config);
     let total = variants.len();
     let mut last_desktop_diagnostics: Option<DesktopDiagnostics> = None;
+    let mut last_log: Option<PathBuf> = None;
 
     for (index, variant) in variants.iter().enumerate() {
         let args = build_args(variant, recording.as_deref());
@@ -653,7 +692,10 @@ pub(crate) fn launch_session(
             last_desktop_diagnostics = Some(outcome.diagnostics);
             outcome.started
         } else {
-            launch_and_watch(&scrcpy, &args)?
+            let log = new_session_log(variant)?;
+            let started = launch_and_watch(&scrcpy, &args, &log)?;
+            last_log = Some(log);
+            started
         };
         if started {
             let fallback_used = index > 0;
@@ -733,9 +775,14 @@ pub(crate) fn launch_session(
         });
     }
 
+    let detail = last_log
+        .and_then(|log| fs::read_to_string(log).ok())
+        .filter(|output| !output.trim().is_empty())
+        .map(|output| format!(" Last error: {}.", compact_error(&output)))
+        .unwrap_or_default();
     Err(format!(
-        "scrcpy exited immediately after {} smart attempts. Open Connection Doctor and verify the device/runtime.",
-        total
+        "scrcpy exited immediately after {} smart attempts.{} Open Connection Doctor and verify the device/runtime.",
+        total, detail
     ))
 }
 
