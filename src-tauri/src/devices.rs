@@ -4,7 +4,7 @@ use crate::{
     preferences::load_learned_profile,
     runtime::{adb_path, output_text, scrcpy_command, scrcpy_path},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub(crate) fn is_wireless_serial(serial: &str) -> bool {
     serial.contains(':') || serial.contains("_adb-tls-")
@@ -44,13 +44,63 @@ pub(crate) fn parse_devices(raw: &str) -> Vec<DeviceInfo> {
         .collect()
 }
 
+/// Maps adb's mDNS auto-connect serials (`name._adb-tls-connect._tcp`) to the
+/// `ip:port` address each one resolves to.
+pub(crate) fn parse_mdns_services(raw: &str) -> HashMap<String, String> {
+    raw.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let name = parts.next()?;
+            let service = parts.next()?;
+            let address = parts.next()?;
+            (service.starts_with("_adb-tls-connect.") && address.contains(':'))
+                .then(|| (format!("{name}.{service}"), address.to_string()))
+        })
+        .collect()
+}
+
+/// adb lists one phone twice when it auto-connects over mDNS while the same
+/// `ip:port` is also connected directly. Keep the `ip:port` entry, which saved
+/// wireless phones reconnect to.
+pub(crate) fn hide_mdns_aliases(
+    devices: Vec<DeviceInfo>,
+    mdns: &HashMap<String, String>,
+) -> Vec<DeviceInfo> {
+    let ready: HashSet<String> = devices
+        .iter()
+        .filter(|device| device.state == "device")
+        .map(|device| device.serial.clone())
+        .collect();
+    devices
+        .into_iter()
+        .filter(|device| {
+            !mdns
+                .get(&device.serial)
+                .is_some_and(|address| ready.contains(address))
+        })
+        .collect()
+}
+
 #[tauri::command(async)]
 pub(crate) fn list_devices() -> Result<Vec<DeviceInfo>, String> {
     let adb = adb_path()?;
-    let mut command = hidden_command(adb);
+    let mut command = hidden_command(&adb);
     command.args(["devices", "-l"]);
     let raw = output_text(command)?;
-    Ok(parse_devices(&raw))
+    let devices = parse_devices(&raw);
+    if !devices
+        .iter()
+        .any(|device| device.serial.contains("._adb-tls-connect."))
+    {
+        return Ok(devices);
+    }
+
+    let mut mdns = hidden_command(&adb);
+    mdns.args(["mdns", "services"]);
+    let aliases = output_text(mdns)
+        .map(|raw| parse_mdns_services(&raw))
+        .unwrap_or_default();
+    Ok(hide_mdns_aliases(devices, &aliases))
 }
 
 fn adb_shell(serial: &str, args: &[&str]) -> Result<String, String> {
@@ -326,6 +376,43 @@ mod tests {
         assert_eq!(devices[0].connection_kind, "usb");
         assert_eq!(devices[1].connection_kind, "wireless");
         assert_eq!(devices[1].state, "unauthorized");
+    }
+
+    const MDNS_ALIAS: &str = "adb-RS6LCYQWJZDAQKPF-QtuZAx._adb-tls-connect._tcp";
+
+    fn mdns_aliases() -> HashMap<String, String> {
+        parse_mdns_services(
+            "List of discovered mdns services\nadb-RS6LCYQWJZDAQKPF-QtuZAx\t_adb-tls-connect._tcp\t192.168.0.101:44501\nadb-RS6LCYQWJZDAQKPF-QtuZAx\t_adb-tls-pairing._tcp\t192.168.0.101:37015\n",
+        )
+    }
+
+    #[test]
+    fn maps_mdns_connect_serials_to_addresses() {
+        let aliases = mdns_aliases();
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(
+            aliases.get(MDNS_ALIAS).map(String::as_str),
+            Some("192.168.0.101:44501")
+        );
+    }
+
+    #[test]
+    fn hides_mdns_alias_of_a_directly_connected_phone() {
+        let raw = format!(
+            "List of devices attached\n192.168.0.101:44501 device product:viva_id model:2201116TG device:viva transport_id:2\n{MDNS_ALIAS} device product:viva_id model:2201116TG device:viva transport_id:1\n"
+        );
+        let devices = hide_mdns_aliases(parse_devices(&raw), &mdns_aliases());
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].serial, "192.168.0.101:44501");
+    }
+
+    #[test]
+    fn keeps_mdns_device_when_its_address_is_not_ready() {
+        let raw = format!(
+            "List of devices attached\n192.168.0.101:44501 offline\n{MDNS_ALIAS} device product:viva_id model:2201116TG device:viva\n"
+        );
+        let devices = hide_mdns_aliases(parse_devices(&raw), &mdns_aliases());
+        assert_eq!(devices.len(), 2);
     }
 
     #[test]

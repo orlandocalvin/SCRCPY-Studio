@@ -84,6 +84,13 @@ function shortVersion(value?: string | null) {
   return value?.split(" <")[0]?.trim() || value || "";
 }
 
+function deviceLabel(device: DeviceInfo) {
+  const name = device.model?.replaceAll("_", " ") || device.serial;
+  const port = device.serial.lastIndexOf(":");
+  const transport = device.connectionKind === "usb" ? "USB" : port > 0 ? `Wi-Fi ${device.serial.slice(0, port)}` : "Wi-Fi";
+  return device.state === "device" ? `${name} · ${transport}` : `${name} · ${transport} — ${device.state}`;
+}
+
 function modePreparationText(mode: SessionMode) {
   if (mode === "camera") return "Loading camera settings…";
   if (mode === "desktop") return "Checking desktop support…";
@@ -669,7 +676,7 @@ function App() {
             <div className="device-select-wrap">
               <select value={selectedSerial} onChange={(e) => setSelectedSerial(e.target.value)} aria-label="Connected device">
                 <option value="">Choose device</option>
-                {devices.map((device) => <option key={device.serial} value={device.serial}>{device.model?.replaceAll("_", " ") || device.serial} — {device.state}</option>)}
+                {devices.map((device) => <option key={device.serial} value={device.serial}>{deviceLabel(device)}</option>)}
               </select>
               <ChevronDown size={16} />
             </div>
