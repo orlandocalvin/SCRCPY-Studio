@@ -34,15 +34,25 @@ There are no frontend tests. Rust unit tests live in `#[cfg(test)] mod tests` at
 - It checks that `config.mode` matches `requestedMode` (this guards against a stale config from a previous mode).
 - It stops any existing session.
 - It builds a list of progressively safer configs with `fallback_configs` (drop high-speed/torch/zoom/encoder, then h264, lower fps, smaller size, and so on).
-- It launches each one with `build_args` and treats it as started if scrcpy is still alive after about 900ms.
+- It launches each one with `build_args` and treats it as started if scrcpy is still alive after about 900ms. scrcpy output goes to a per-session file in `<app data>/Session Logs` (the newest 40 are kept), and a failure message quotes the relevant error line from it.
 - The first success is saved per device+mode via `preferences::remember_successful_profile`.
 
-Device settings the app changes for live options (show_touches, stay_awake) are backed up and restored when the session ends. On Windows, the scrcpy window is found by the title `SCRCPY Studio · <serial>` and controlled through Win32 messages.
+show_touches is a device setting, so it is backed up and restored when the session ends. Keep awake uses `--keep-active` rather than `--stay-awake`, because `--stay-awake` only works while the phone is charging. On Windows, the scrcpy window is found by the title `SCRCPY Studio · <serial>` and controlled through Win32 messages. `PostMessage` key presses (Alt shortcuts) work without focusing the window, but F11 needs it in the foreground.
+
+**Phone state watch (Mirror only, `watches_phone_power`).** The frontend polls `session_status` every 900ms, and that call is also where the backend syncs session state:
+- Every 3s it reads the phone state with one adb shell call (`PHONE_STATE_QUERY`: `dumpsys power`, SurfaceFlinger `powerMode`, keyguard).
+- Presses on the phone are caught as they happen by `physical_input.rs`, which runs `adb shell -tt getevent -lq`. The `-tt` pty is required, because without it the output is buffered and nothing arrives.
+- If the user wakes the phone while "Turn screen off" is on, `PhoneControl` stops keeping it off, the toggle goes OFF, and a `notice` is returned.
+- The Fullscreen toggle follows the scrcpy window's real size.
+- Watch events go to `<session>.events.log` via `event_log.rs`. Read that file first when debugging power behavior.
+
+On the HyperOS test phone, turning the panel back on with MOD+Shift+o leaves the backlight dark. `relight_backlight` fixes that by nudging the screen brightness.
 
 **Device intelligence.** `devices.rs` (`inspect_device`, `recommend_settings` per mode), `camera.rs` (parses `scrcpy --list-cameras`/sizes), and `desktop.rs` (the largest module) all turn raw adb/dumpsys/scrcpy text into typed capabilities.
 
 **Desktop Mode (`desktop.rs`).** It separates three cases and must not treat them as the same thing: a generic `--new-display` virtual display, Android desktop windowing (freeform), and Samsung DeX (only captured when firmware already exposes an active DeX display). Details:
-- `probe_desktop_capabilities` is the single source of truth. The frontend launch button is gated on `desktopProbe.capabilities?.supported`.
+- `probe_desktop_capabilities` is the single source of truth. The frontend launch button is gated on `desktopProbe.capabilities?.supported`. Only one probe runs at a time (`PROBE_LOCK` in the backend, a shared in-flight promise in `DesktopControls.tsx`), and a finished probe must not overwrite the user's choices.
+- A desktop launch counts as started only after scrcpy prints "New display" (up to 10s). The virtual display is kept from rotating with portrait-only apps via `wm set-ignore-orientation-request`.
 - Probes must not disturb the phone's own screen.
 - `enable_desktop_experience` backs up global settings to `desktop-settings-backup.json` before changing them, then reboots and reconnects. `restore_desktop_experience` puts them back.
 - Detailed diagnostics go to log files under the app data dir ("Desktop Diagnostics"), opened via "Open Logs". They are not shown in the UI.
