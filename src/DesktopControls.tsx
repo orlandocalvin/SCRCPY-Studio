@@ -3,6 +3,7 @@ import {
   CheckCircle2,
   CircleAlert,
   FolderOpen,
+  Info,
   RefreshCw,
   RotateCcw,
   Sparkles
@@ -186,6 +187,10 @@ export default function DesktopControls({ serial, config, onChange, onStatus, on
             <button className="secondary wide" onClick={() => void changeDeveloperSettings("restore_desktop_experience")} disabled={busy}>
               {busy ? <RefreshCw size={16} className="spin" /> : <RotateCcw size={16} />} Restore Original Android Settings & Restart
             </button>
+          )}
+
+          {capabilities.needsStartApp && !config.desktopStartApp?.trim() && (
+            <div className="finding info"><Info size={18} /><div><strong>Choose an app to start</strong><span>This phone shows a blank screen on new displays. Set Start app package in More settings, for example com.android.settings.</span></div></div>
           )}
 
           {lastLaunchResult && !lastLaunchResult.started && (

@@ -170,6 +170,7 @@ export interface DesktopCapabilities {
   flexSupported: boolean;
   systemDecorationsSupported: boolean;
   keepContentSupported: boolean;
+  needsStartApp: boolean;
   launcherPackage?: string | null;
   startupPackage: string;
   desktopExperiencePrepared: boolean;

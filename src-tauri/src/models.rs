@@ -224,6 +224,7 @@ pub(crate) struct DesktopCapabilities {
     pub(crate) flex_supported: bool,
     pub(crate) system_decorations_supported: bool,
     pub(crate) keep_content_supported: bool,
+    pub(crate) needs_start_app: bool,
     pub(crate) launcher_package: Option<String>,
     pub(crate) startup_package: String,
     pub(crate) desktop_experience_prepared: bool,

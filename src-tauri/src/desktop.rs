@@ -725,6 +725,15 @@ fn collect_display_diagnostics(
     }
 }
 
+/// Secondary-display launchers that run on a virtual display but draw nothing,
+/// leaving the window black until an app is started.
+const EMPTY_SECONDARY_LAUNCHERS: &[&str] = &["com.miui.home/.launcher.SecondaryDisplayLauncher"];
+
+/// Whether a created virtual display stays black unless an app is started.
+fn needs_start_app(launcher_activity: Option<&str>) -> bool {
+    launcher_activity.is_none_or(|activity| EMPTY_SECONDARY_LAUNCHERS.contains(&activity))
+}
+
 fn is_secondary_home_activity(activity: &str) -> bool {
     let activity = activity.to_ascii_lowercase();
     activity.contains("secondarylauncher")
@@ -1172,6 +1181,7 @@ pub(crate) fn probe_desktop_capabilities(serial: String) -> Result<DesktopCapabi
             flex_supported: false,
             system_decorations_supported: false,
             keep_content_supported: false,
+            needs_start_app: false,
             launcher_package,
             startup_package: String::new(),
             desktop_experience_prepared: false,
@@ -1284,6 +1294,9 @@ pub(crate) fn probe_desktop_capabilities(serial: String) -> Result<DesktopCapabi
             && existing_display_id.is_none(),
         keep_content_supported: help.contains("--no-vd-destroy-content")
             && existing_display_id.is_none(),
+        needs_start_app: probe.success
+            && existing_display_id.is_none()
+            && needs_start_app(diagnostics.launcher_activity.as_deref()),
         launcher_package,
         startup_package: String::new(),
         desktop_experience_prepared: android_desktop_active || dex_capturable,
@@ -1317,6 +1330,18 @@ mod tests {
     fn compact_error_skips_generic_demuxer_errors() {
         let output = "[stderr] ERROR: Could not find any ADB device\n[stderr] ERROR: Demuxer error\n[stderr] Killed";
         assert_eq!(compact_error(output), "Could not find any ADB device");
+    }
+
+    #[test]
+    fn detects_virtual_displays_that_stay_black_without_an_app() {
+        assert!(needs_start_app(None));
+        assert!(needs_start_app(Some(
+            "com.miui.home/.launcher.SecondaryDisplayLauncher"
+        )));
+        assert!(!needs_start_app(Some(
+            "com.google.android.apps.nexuslauncher/.SecondaryDisplayLauncher"
+        )));
+        assert!(!needs_start_app(Some("com.android.settings/.MainSettings")));
     }
 
     #[test]
