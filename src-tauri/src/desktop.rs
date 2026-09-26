@@ -91,13 +91,38 @@ fn scrcpy_help() -> Result<String, String> {
     output_text(command)
 }
 
-fn compact_error(text: &str) -> String {
-    let line = text
+fn strip_output_prefixes(line: &str) -> &str {
+    let mut line = line.trim();
+    for prefix in ["[stdout]", "[stderr]", "[server]"] {
+        line = line.strip_prefix(prefix).map_or(line, str::trim_start);
+    }
+    line
+}
+
+/// Picks the line that best explains a failed scrcpy run: the server's Java
+/// exception message, then a specific ERROR line, then the last line.
+pub(crate) fn compact_error(text: &str) -> String {
+    let lines: Vec<&str> = text
         .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or(text)
-        .trim();
+        .map(strip_output_prefixes)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let exception = lines.iter().rev().find_map(|line| {
+        line.split_once("Exception: ")
+            .map(|(_, message)| message.trim())
+    });
+    let specific_error = || {
+        lines.iter().rev().find_map(|line| {
+            let message = line.strip_prefix("ERROR: ")?.trim();
+            let generic =
+                message.starts_with("Exception on thread") || message.starts_with("Demuxer");
+            (!generic).then_some(message)
+        })
+    };
+    let line = exception
+        .or_else(specific_error)
+        .or_else(|| lines.last().copied())
+        .unwrap_or_else(|| text.trim());
     if line.chars().count() > 220 {
         format!("{}…", line.chars().take(220).collect::<String>())
     } else {
@@ -862,6 +887,8 @@ fn display_id_from_args(args: &[String]) -> Option<u32> {
     })
 }
 
+const NEW_DISPLAY_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub(crate) fn launch_desktop_and_watch(
     path: &Path,
     args: &[String],
@@ -898,11 +925,18 @@ pub(crate) fn launch_desktop_and_watch(
         readers.push(reader_thread(stderr, "stderr", sender, lines.clone()));
     }
 
-    let deadline = Instant::now() + Duration::from_millis(2500);
+    // A --new-display launch only counts as started once scrcpy reports the
+    // created display. When the server crashes while preparing the capture
+    // (an invalid crop, for example), the client can stay alive for several
+    // seconds over Wi-Fi and would otherwise look like a running session.
+    let waits_for_new_display = diagnostics.display_id.is_none();
+    let deadline = Instant::now() + NEW_DISPLAY_TIMEOUT;
     let mut early_status = None;
+    let mut created_display = None;
     while Instant::now() < deadline && diagnostics.display_id.is_none() {
         if let Ok(line) = receiver.recv_timeout(Duration::from_millis(100)) {
             if let Some((width, height, density, display_id)) = parse_new_display(&line) {
+                created_display = Some(display_id);
                 diagnostics.display_id = Some(display_id);
                 diagnostics.resolution = Some(format!("{width}x{height}"));
                 diagnostics.density = Some(density);
@@ -912,6 +946,24 @@ pub(crate) fn launch_desktop_and_watch(
             early_status = Some(status);
             break;
         }
+    }
+
+    if waits_for_new_display && created_display.is_none() && early_status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        for reader in readers {
+            let _ = reader.join();
+        }
+        diagnostics.exit_result = format!(
+            "stopped: scrcpy did not report a new display within {} s",
+            NEW_DISPLAY_TIMEOUT.as_secs()
+        );
+        diagnostics.scrcpy_output = joined_output(&lines);
+        let _ = write_new_diagnostic_log("launch-failed", serial, &mut diagnostics);
+        return Ok(DesktopLaunchOutcome {
+            started: false,
+            diagnostics,
+        });
     }
 
     if let Some(display_id) = diagnostics.display_id {
@@ -1207,6 +1259,21 @@ mod tests {
     #[test]
     fn compact_error_prefers_last_nonempty_line() {
         assert_eq!(compact_error("first\n\nlast"), "last");
+    }
+
+    #[test]
+    fn compact_error_prefers_the_server_exception_message() {
+        let output = "[stdout] INFO: Renderer: direct3d11\n[stderr] ERROR: Demuxer 'audio': stream disabled due to connection error\n[stderr] ERROR: Demuxer error\n[stderr] [server] ERROR: Exception on thread Thread[video,5,main]\n[stderr] java.lang.IllegalArgumentException: Crop Rect(0, 0 - 1080, 1920) exceeds the input area (1280x720)\n[stderr] \tat com.genymobile.scrcpy.video.VideoFilter.addCrop(VideoFilter.java:59)\n[stderr] Killed";
+        assert_eq!(
+            compact_error(output),
+            "Crop Rect(0, 0 - 1080, 1920) exceeds the input area (1280x720)"
+        );
+    }
+
+    #[test]
+    fn compact_error_skips_generic_demuxer_errors() {
+        let output = "[stderr] ERROR: Could not find any ADB device\n[stderr] ERROR: Demuxer error\n[stderr] Killed";
+        assert_eq!(compact_error(output), "Could not find any ADB device");
     }
 
     #[test]

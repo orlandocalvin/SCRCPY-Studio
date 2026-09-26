@@ -1,6 +1,6 @@
 use crate::{
     creator::recordings_root,
-    desktop::launch_desktop_and_watch,
+    desktop::{compact_error, launch_desktop_and_watch},
     devices::list_devices,
     models::{DesktopDiagnostics, LaunchConfig, LaunchResult, SessionStatus},
     preferences::remember_successful_profile,
@@ -517,6 +517,21 @@ fn push_variant(variants: &mut Vec<LaunchConfig>, mutator: impl FnOnce(&mut Laun
 
 pub(crate) fn fallback_configs(original: &LaunchConfig) -> Vec<LaunchConfig> {
     let mut variants = vec![original.clone()];
+    // A manual crop outside the captured area kills every attempt, so it is
+    // the first option to drop.
+    if safe_crop(original.crop.as_deref()).is_some() {
+        push_variant(&mut variants, |next| next.crop = None);
+    }
+    variants = mode_fallbacks(variants);
+    // Skip retries that would launch the exact same command, e.g. dropping a
+    // crop that --flex-display already suppressed.
+    variants.dedup_by(|next, previous| build_args(next, None) == build_args(previous, None));
+    variants
+}
+
+fn mode_fallbacks(mut variants: Vec<LaunchConfig>) -> Vec<LaunchConfig> {
+    let original = variants[0].clone();
+    let original = &original;
 
     if original.mode == "camera" {
         if original.camera_high_speed {
@@ -706,13 +721,11 @@ pub(crate) fn launch_session(
 
     if config.mode == "desktop" {
         let diagnostics = last_desktop_diagnostics.unwrap_or_default();
-        let detail = diagnostics
-            .scrcpy_output
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or(&diagnostics.exit_result)
-            .trim();
+        let detail = if diagnostics.scrcpy_output.trim().is_empty() {
+            diagnostics.exit_result.clone()
+        } else {
+            compact_error(&diagnostics.scrcpy_output)
+        };
         return Ok(LaunchResult {
             started: false,
             fallback_used: total > 1,
@@ -1002,6 +1015,30 @@ mod tests {
         config.desktop_flex = false;
         let args = build_args(&config, None);
         assert!(args.contains(&"--crop=1080:1920:0:0".to_string()));
+    }
+
+    #[test]
+    fn crop_is_the_first_fallback_to_drop() {
+        let mut config = sample_config("mirror");
+        config.crop = Some("1080:1920:0:0".into());
+        let variants = fallback_configs(&config);
+        assert_eq!(variants[0].crop.as_deref(), Some("1080:1920:0:0"));
+        assert_eq!(variants[1].crop, None);
+        assert_eq!(variants[1].codec, config.codec);
+        assert!(variants[1..].iter().all(|variant| variant.crop.is_none()));
+    }
+
+    #[test]
+    fn fallbacks_never_repeat_the_same_command() {
+        let mut config = sample_config("desktop");
+        config.crop = Some("1080:1920:0:0".into());
+        config.desktop_flex = true;
+        let variants = fallback_configs(&config);
+        // Flex already suppresses the crop, so dropping it alone is skipped.
+        assert!(variants[1].crop.is_none() && !variants[1].desktop_flex);
+        for pair in variants.windows(2) {
+            assert_ne!(build_args(&pair[0], None), build_args(&pair[1], None));
+        }
     }
 
     #[test]
