@@ -32,25 +32,34 @@ export default function DesktopControls({ serial, config, onChange, onStatus, on
   const [error, setError] = useState<string | null>(null);
   const activeSerial = useRef(serial);
   const inFlightProbe = useRef<{ serial: string; request: Promise<DesktopCapabilities> } | null>(null);
+  // A probe takes several seconds; merge its result into the latest config,
+  // not the one captured when it started, so edits made meanwhile survive.
+  const latestConfig = useRef(config);
+  latestConfig.current = config;
 
   const updateConfig = useCallback((patch: Partial<LaunchConfig>) => {
-    if (config.serial !== serial || config.mode !== "desktop") return;
-    onChange({ ...config, ...patch });
-  }, [config, onChange, serial]);
+    const current = latestConfig.current;
+    if (current.serial !== serial || current.mode !== "desktop") return;
+    onChange({ ...current, ...patch });
+  }, [onChange, serial]);
 
   const applyCapabilities = useCallback((result: DesktopCapabilities) => {
     setCapabilities(result);
     setError(null);
+    const current = latestConfig.current;
+    const firstResult = !current.desktopEnvironment || current.desktopEnvironment === "unavailable";
+    // Keep the user's choices; only turn off options this device cannot use.
     updateConfig({
       desktopEnvironment: result.environmentKind,
       desktopDisplayId: result.existingDisplayId ?? null,
-      desktopWidth: result.recommendedWidth,
-      desktopHeight: result.recommendedHeight,
-      desktopDensity: result.recommendedDensity,
-      desktopFlex: false,
-      desktopNoDecorations: false,
-      desktopKeepContent: false,
-      desktopStartApp: null
+      ...(firstResult ? {
+        desktopWidth: result.recommendedWidth,
+        desktopHeight: result.recommendedHeight,
+        desktopDensity: result.recommendedDensity
+      } : {}),
+      desktopFlex: result.flexSupported && Boolean(current.desktopFlex),
+      desktopNoDecorations: result.systemDecorationsSupported && Boolean(current.desktopNoDecorations),
+      desktopKeepContent: result.keepContentSupported && Boolean(current.desktopKeepContent)
     });
     onProbeStateChange({ serial, checking: false, capabilities: result, error: null });
     onStatus(result.message);
