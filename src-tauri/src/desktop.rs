@@ -4,7 +4,7 @@ use crate::{
     models::{
         DesktopCapabilities, DesktopDiagnostics, DesktopExperienceResult, DesktopSettingDiagnostic,
     },
-    runtime::{adb_path, output_text, scrcpy_path},
+    runtime::{adb_path, output_text, scrcpy_command, scrcpy_path},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -791,7 +791,7 @@ fn run_virtual_display_probe(
         ..DesktopDiagnostics::default()
     };
 
-    let mut child = hidden_command(&scrcpy)
+    let mut child = scrcpy_command(&scrcpy)
         .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -877,7 +877,7 @@ pub(crate) fn launch_desktop_and_watch(
         ..DesktopDiagnostics::default()
     };
 
-    let mut child = hidden_command(path)
+    let mut child = scrcpy_command(path)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

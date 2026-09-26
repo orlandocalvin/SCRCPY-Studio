@@ -2,7 +2,7 @@ use crate::{
     commands::hidden_command,
     models::{DeviceInfo, DeviceProfile, Recommendation, VideoEncoderInfo},
     preferences::load_learned_profile,
-    runtime::{adb_path, output_text, scrcpy_path},
+    runtime::{adb_path, output_text, scrcpy_command, scrcpy_path},
 };
 use std::collections::HashMap;
 
@@ -128,7 +128,7 @@ fn list_video_encoders(serial: &str) -> Vec<VideoEncoderInfo> {
     let Ok(scrcpy) = scrcpy_path() else {
         return Vec::new();
     };
-    let mut command = hidden_command(scrcpy);
+    let mut command = scrcpy_command(&scrcpy);
     command.args(["-s", serial, "--list-encoders"]);
     match output_text(command) {
         Ok(text) => parse_video_encoders(&text),

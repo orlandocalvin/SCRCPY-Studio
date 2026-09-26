@@ -107,7 +107,7 @@ fn tool_version(path: &Path, arg: &str) -> Option<String> {
 
 #[tauri::command(async)]
 pub(crate) fn runtime_status() -> RuntimeStatus {
-    let adb = resolve_binary("adb");
+    let adb = adb_path().ok();
     let scrcpy = resolve_binary("scrcpy");
     RuntimeStatus {
         adb_found: adb.is_some(),
@@ -295,8 +295,19 @@ printf '%s\n' "Installed verified official runtime: $asset"
     }
 }
 
+/// Reads the same `ADB` override scrcpy honors, so a machine with Android SDK
+/// platform-tools can run one adb server for every tool.
+fn adb_override(value: Option<OsString>) -> Option<PathBuf> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+}
+
 pub(crate) fn adb_path() -> Result<PathBuf, String> {
-    resolve_binary("adb").ok_or_else(|| {
+    adb_override(env::var_os("ADB"))
+        .or_else(|| resolve_binary("adb"))
+        .ok_or_else(|| {
         #[cfg(target_os = "windows")]
         let message = "ADB was not found. Use Install official runtime in SCRCPY Studio, install Android Platform Tools, or place adb in the runtime folder.";
         #[cfg(target_os = "linux")]
@@ -307,9 +318,55 @@ pub(crate) fn adb_path() -> Result<PathBuf, String> {
     })
 }
 
+/// Starts scrcpy against the adb SCRCPY Studio uses. Otherwise scrcpy picks the
+/// adb next to its own executable, and a different adb version restarts the
+/// shared adb server.
+pub(crate) fn scrcpy_command(scrcpy: &Path) -> Command {
+    let mut command = hidden_command(scrcpy);
+    if let Ok(adb) = adb_path() {
+        command.env("ADB", adb);
+    }
+    command
+}
+
 pub(crate) fn scrcpy_path() -> Result<PathBuf, String> {
     resolve_binary("scrcpy").ok_or_else(|| {
         "scrcpy was not found. Use Install official runtime in SCRCPY Studio, install official scrcpy, or place it in the runtime folder."
             .into()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adb_override_ignores_unset_empty_and_missing_paths() {
+        assert_eq!(adb_override(None), None);
+        assert_eq!(adb_override(Some(OsString::new())), None);
+        assert_eq!(
+            adb_override(Some(OsString::from("definitely-missing-adb.exe"))),
+            None
+        );
+    }
+
+    #[test]
+    fn adb_override_accepts_an_existing_file() {
+        let existing = env::current_exe().expect("test executable path");
+        assert_eq!(
+            adb_override(Some(existing.clone().into_os_string())),
+            Some(existing)
+        );
+    }
+
+    #[test]
+    fn scrcpy_command_shares_the_resolved_adb() {
+        let command = scrcpy_command(Path::new("scrcpy"));
+        assert_eq!(command.get_program(), "scrcpy");
+        let forwarded = command
+            .get_envs()
+            .find(|(key, _)| *key == "ADB")
+            .and_then(|(_, value)| value.map(PathBuf::from));
+        assert_eq!(forwarded, adb_path().ok());
+    }
 }

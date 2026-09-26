@@ -1,11 +1,10 @@
 use crate::{
-    commands::hidden_command,
     creator::recordings_root,
     desktop::launch_desktop_and_watch,
     devices::list_devices,
     models::{DesktopDiagnostics, LaunchConfig, LaunchResult, SessionStatus},
     preferences::remember_successful_profile,
-    runtime::{adb_path, scrcpy_path},
+    runtime::{adb_path, scrcpy_command, scrcpy_path},
 };
 use chrono::Local;
 use std::{
@@ -485,7 +484,7 @@ fn shell_preview(path: &Path, args: &[String]) -> String {
 }
 
 fn launch_and_watch(path: &Path, args: &[String]) -> Result<bool, String> {
-    let mut child = hidden_command(path)
+    let mut child = scrcpy_command(path)
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
